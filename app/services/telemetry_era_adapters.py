@@ -41,7 +41,7 @@ _C2_PRETRANSLATION_MATCH_WINDOW = timedelta(minutes=2)
 SCHEMA_VERSION_KEY = "amul.schema_version"
 
 
-def _chat_has_full_turn_root(turn: CanonicalChatTurn) -> bool:
+def chat_has_full_turn_root(turn: CanonicalChatTurn) -> bool:
     """Only these chat eras root a full farmer turn rather than an agent step."""
 
     return turn.source_era in {"chat.c6", "chat.c8"} or turn.source_schema_version.startswith("chat.turn.")
