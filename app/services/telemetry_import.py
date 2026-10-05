@@ -24,8 +24,8 @@ from app.models.telemetry_analytics import CanonicalChatTurn
 from app.models.telemetry_voice_analytics import CanonicalVoiceTurn
 from app.services.telemetry_era_adapters import (
     UnsupportedTelemetryEra,
-    _chat_has_full_turn_root,
     adapt_chat_trace,
+    chat_has_full_turn_root,
 )
 from app.services.telemetry_era_registry import TelemetryEraRegistry, load_yaml_file
 from app.services.telemetry_fetcher import (
@@ -479,7 +479,7 @@ def _import_days(
         # the latest completed child. Earlier chat roots represent agent work,
         # not a whole farmer turn, so their duration stays ledger-only.
         for turn in accepted_turns:
-            if table == "chat" and _chat_has_full_turn_root(turn) and turn.full_turn_latency_ms is None:
+            if table == "chat" and chat_has_full_turn_root(turn) and turn.full_turn_latency_ms is None:
                 identity = identities_by_id.get(turn.source_trace_id)
                 if identity is not None and identity.duration_ms is not None:
                     turn = turn.model_copy(update={
