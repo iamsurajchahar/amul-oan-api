@@ -190,6 +190,7 @@ cython_debug/
 # Local
 /scripts/*
 !/scripts/validate_district_coords.py
+!/scripts/probe_vistaar_weather.py
 /exploration/*
 /evals/*
 

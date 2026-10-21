@@ -109,6 +109,15 @@ class VistaarLegUnavailable(RuntimeError):
     """
 
 
+class VistaarNoCatalogue(VistaarLegUnavailable):
+    """The leg answered, but with no catalogue (see `_on_search_failure`).
+
+    Raised only under `strict`. Unlike a dead leg it does not end the candidate
+    walk — the next point may still answer, as it did when this read as zero
+    rows — and is re-raised only if no candidate returns rows.
+    """
+
+
 def _context() -> dict[str, Any]:
     return {
         "domain": "schemes:vistaar",
@@ -142,13 +151,47 @@ def _items(body: dict) -> list[dict]:
     return out
 
 
-async def _vistaar_search(intent: dict) -> list[dict]:
+def _reply_has_items(reply: dict) -> bool:
+    message = reply.get("message")
+    catalog = message.get("catalog") if isinstance(message, dict) else None
+    providers = catalog.get("providers") if isinstance(catalog, dict) else None
+    return any(isinstance(p, dict) and p.get("items") for p in providers or [])
+
+
+def _on_search_failure(body: dict) -> Optional[str]:
+    """Why an on_search body holds no catalogue at all, or None if it does.
+
+    Catches what a zero-row read hides: the sync BAP client's empty
+    `responses: []` wrapper (no provider replied before its internal timeout)
+    and replies that are all signed Beckn error callbacks (`{"context",
+    "error"}`) — the shape the Amul network client already treats as a failed
+    leg. A reply that carries rows alongside an `error` still counts as rows.
+    """
+    responses = body.get("responses")
+    replies = responses if isinstance(responses, list) else [body]
+    if not replies:
+        return "no on_search returned"
+    errors = [
+        r["error"] for r in replies
+        if isinstance(r, dict) and r.get("error") and not _reply_has_items(r)
+    ]
+    if len(errors) == len(replies):
+        return f"error callback: {errors[0]}"
+    return None
+
+
+async def _vistaar_search(intent: dict, strict: bool = False) -> list[dict]:
     """Run one BV intent and return its items.
 
     Raises VistaarLegUnavailable when the seeker reports the leg as failed, or
     hands back no on_search body for it. Previously this read only
     `results.<leg>` and dropped `errors` on the floor, so a dead leg returned
     `[]` and every caller announced "none found".
+
+    `strict` also raises VistaarNoCatalogue when the on_search holds no
+    catalogue (see `_on_search_failure`) instead of reading it as zero rows. Weather opts in;
+    mandi and scheme info keep their existing handling until it has been
+    checked against them live — mandi walks candidates on zero rows.
     """
     async with httpx.AsyncClient(timeout=settings.amul_network_timeout_s) as client:
         if VISTAAR_SEEKER_URL:
@@ -169,6 +212,10 @@ async def _vistaar_search(intent: dict) -> list[dict]:
                     VISTAAR_LEG, leg_error, type(on_search).__name__,
                 )
                 raise VistaarLegUnavailable(str(leg_error or "no on_search returned"))
+            failure = _on_search_failure(on_search) if strict else None
+            if failure:
+                logger.warning("vistaar leg returned no catalogue leg=%s reason=%s", VISTAAR_LEG, failure)
+                raise VistaarNoCatalogue(failure)
             return _items(on_search)
         # Fallback: call the BV sandbox BAP directly (sync inline on_search).
         r = await client.post(
@@ -184,6 +231,10 @@ async def _vistaar_search(intent: dict) -> list[dict]:
         if body.get("responses") == []:
             logger.warning("vistaar direct BAP returned no on_search responses")
             raise VistaarLegUnavailable("no on_search returned")
+        failure = _on_search_failure(body) if strict else None
+        if failure:
+            logger.warning("vistaar direct BAP returned no catalogue reason=%s", failure)
+            raise VistaarNoCatalogue(failure)
         return _items(body)
 
 
@@ -268,7 +319,7 @@ def _location_phrase(where: SearchLocation, candidate: Candidate) -> str:
     return f"{candidate.town}, {where.location.display}"
 
 
-def _assumed_location_note(where: SearchLocation) -> str:
+def _assumed_location_note(where: SearchLocation, what: str = "prices") -> str:
     """Answer-then-invite, for a farmer whose profile carries no district.
 
     Deliberately NOT a blocking clarification question. A farmer who asked for
@@ -277,6 +328,12 @@ def _assumed_location_note(where: SearchLocation) -> str:
     window and dropped the call outright. So: answer, then say plainly whose
     market this is and invite a correction — once, in one sentence.
     """
+    if what == "weather":
+        return (
+            f"\n\nThis is the {where.location.display}-area forecast, used because I "
+            "do not have your district on file. Tell me your district and I will "
+            "use it next time."
+        )
     return (
         f"\n\nThese are {where.location.display}-area prices, used because I do not "
         "have your district on file. Tell me your district and I will use your "
@@ -285,7 +342,7 @@ def _assumed_location_note(where: SearchLocation) -> str:
 
 
 async def _search_candidates(
-    build_intent: Callable[[Candidate], dict], where: SearchLocation
+    build_intent: Callable[[Candidate], dict], where: SearchLocation, strict: bool = False
 ) -> tuple[list[dict], Candidate]:
     """Try each candidate in order until one returns rows.
 
@@ -294,14 +351,22 @@ async def _search_candidates(
     not cover a large district (Bhuj → Rapar is 106 km). A failed *leg* is not
     zero rows and is left to propagate — walking coordinates during an upstream
     outage would burn 3 × 2.2 s to reach the same "temporarily unavailable".
+
+    Under `strict`, a reply with no catalogue is walked past exactly like zero
+    rows, so the calls made are unchanged; it is raised only if no candidate
+    returns rows, so the caller can say "unavailable" rather than "none found".
     """
     candidates = where.location.candidates[:MANDI_MAX_CANDIDATES] or (
         DEFAULT_LOCATION.primary,
     )
     tried = candidates[0]
+    no_catalogue: Optional[VistaarNoCatalogue] = None
     for candidate in candidates:
         tried = candidate
-        items = await _vistaar_search(build_intent(candidate))
+        try:
+            items = await _vistaar_search(build_intent(candidate), strict=strict)
+        except VistaarNoCatalogue as exc:
+            no_catalogue, items = exc, []
         if items:
             return items, candidate
         if candidate is not candidates[-1]:
@@ -309,6 +374,8 @@ async def _search_candidates(
                 "vistaar: zero rows at %s (%s), trying next candidate",
                 candidate.town, where.location.display,
             )
+    if no_catalogue is not None:
+        raise no_catalogue
     return [], tried
 
 
@@ -462,6 +529,16 @@ def _format_mandi_items(items: list[dict], max_rows: int = 40) -> str:
     return "\n".join(lines)
 
 
+def _weather_intent(candidate: Candidate) -> dict:
+    """The Mausamgram forecast intent — the same shape bharat-oan-api's own
+    weather tool sends to this BPP. Module-level so the probe script sends
+    exactly this rather than a copy that can drift."""
+    return {
+        "category": {"descriptor": {"name": "Weather-Forecast-Mausamgram", "code": "WFC"}},
+        "fulfillment": {"stops": [{"location": {"lat": candidate.lat, "lon": candidate.lon}}]},
+    }
+
+
 async def get_vistaar_weather(
     ctx: RunContext[FarmerContext],
     location: Optional[str] = None,
@@ -486,22 +563,35 @@ async def get_vistaar_weather(
         return refusal
     assert where is not None
 
-    def build(candidate: Candidate) -> dict:
-        return {
-            "category": {"descriptor": {"name": "Weather-Forecast-Mausamgram", "code": "WFC"}},
-            "fulfillment": {"stops": [{"location": {"lat": candidate.lat, "lon": candidate.lon}}]},
-        }
-
     try:
-        items, used = await _search_candidates(build, where)
+        items, used = await _search_candidates(_weather_intent, where, strict=True)
+    except VistaarLegUnavailable as exc:
+        # A failed leg is NOT an empty forecast — same rule as mandi. Logged
+        # with the reason so an outage names its hop.
+        logger.warning(
+            "vistaar weather leg unavailable district=%s reason=%s", where.location.key, exc
+        )
+        return "Weather is temporarily unavailable from Bharat Vistaar. Please try again shortly."
     except Exception:
         logger.exception("vistaar weather failed district=%s", where.location.key)
         return "Weather is temporarily unavailable from Bharat Vistaar."
+    place = _location_phrase(where, used)
     if not items:
-        return f"No weather forecast was returned for {_location_phrase(where, used)}."
-    header = f"Weather forecast for {_location_phrase(where, used)}:\n"
-    body = header + _format_items(items)
-    return body + (_assumed_location_note(where) if where.assumed else "")
+        logger.info("vistaar weather place=%s source=%s items=0", place, where.source)
+        return f"No weather forecast was returned for {place}."
+    forecast = _format_items(items)
+    if not forecast:
+        # Rows arrived but none carried a field we render. Returning the bare
+        # header handed the model an empty forecast, which it reported as a
+        # failed lookup with nothing in the logs to say why.
+        logger.warning(
+            "vistaar weather rendered empty place=%s items=%d first_item_keys=%s",
+            place, len(items), sorted(items[0]),
+        )
+        return "Weather is temporarily unavailable from Bharat Vistaar."
+    logger.info("vistaar weather place=%s source=%s items=%d", place, where.source, len(items))
+    body = f"Weather forecast for {place}:\n" + forecast
+    return body + (_assumed_location_note(where, "weather") if where.assumed else "")
 
 
 async def get_vistaar_mandi_prices(
